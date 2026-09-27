@@ -23,6 +23,10 @@ class ConflictError(DomainError):
     """A version or uniqueness constraint was violated."""
 
 
+class StockShortage(ConflictError):
+    """库存不足以完成本次发放：不扣减药品、不产生发放单。"""
+
+
 class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 

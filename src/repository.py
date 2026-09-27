@@ -1,8 +1,9 @@
 import json
 import sqlite3
 from datetime import datetime, timezone
+from uuid import uuid4
 
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, StockShortage
 
 
 def utcnow():
@@ -54,7 +55,20 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_pep_active_contact
+                    ON entities(json_extract(data, '$.contact_id'))
+                    WHERE kind = 'pep_dispense' AND status = 'active';
             """)
+
+    def find_active_dispense(self, contact_id):
+        """返回该接触者当前仍有效的发放单（已撤销的不占位）。"""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM entities WHERE kind = 'pep_dispense' AND status = 'active' "
+                "AND json_extract(data, '$.contact_id') = ?",
+                (contact_id,),
+            ).fetchone()
+        return self._entity_from_row(row) if row else None
 
     @staticmethod
     def _entity_from_row(row):
@@ -139,6 +153,59 @@ class SQLiteRepository:
         finally:
             connection.close()
         return self.get_entity(entity_id)
+
+    def create_pep_dispense(self, dispense_id, dispense_data, lot_id, actor_id):
+        """单事务：锁定批号、核库存、扣数量、写发放单。
+
+        库存不足或并发导致同一接触者重复发放时整体回滚，
+        不扣减药品、不产生发放单。
+        """
+        now = utcnow()
+        dispense_payload = json.dumps(dispense_data, ensure_ascii=False, sort_keys=True)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, data FROM entities WHERE id = ? AND kind = 'drug_lot'",
+                (lot_id,),
+            ).fetchone()
+            if not row:
+                raise NotFoundError("drug lot not found: " + lot_id)
+            if row["status"] != "active":
+                raise ConflictError("drug lot %s is not active" % lot_id)
+            current_lot = json.loads(row["data"])
+            quantity = int(dispense_data["quantity"])
+            remaining = int(current_lot.get("quantity_remaining", 0))
+            if remaining < quantity:
+                raise StockShortage(
+                    "insufficient stock in lot %s: remaining %s, requested %s"
+                    % (lot_id, remaining, quantity)
+                )
+            current_lot["quantity_remaining"] = remaining - quantity
+            connection.execute(
+                "UPDATE entities SET version = version + 1, data = ?, updated_at = ? WHERE id = ?",
+                (
+                    json.dumps(current_lot, ensure_ascii=False, sort_keys=True),
+                    now,
+                    lot_id,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, 'pep_dispense', 'active', 1, ?, ?, ?, ?)",
+                (dispense_id, dispense_payload, actor_id, now, now),
+            )
+            connection.commit()
+        except sqlite3.IntegrityError:
+            # 命中 ux_pep_active_contact：已有有效发放单，调用方转幂等返回
+            connection.rollback()
+            raise
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(dispense_id), self.get_entity(lot_id)
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:

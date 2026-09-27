@@ -1,7 +1,9 @@
+import sqlite3
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, StockShortage
+from .repository import utcnow
 from .rules import RuleEngine
 
 
@@ -63,6 +65,63 @@ class DomainService:
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
         return entity
+
+    def dispense_pep(self, actor, data, now=None):
+        """发放暴露后预防药品。
+
+        成功扣减批号库存并生成一份 active 发放单；库存不足时整体拒绝，
+        不扣药也不产生单据。同一接触者已有有效发放单时，重复提交直接
+        返回原单据（不重复发药）。返回 (entity, created)。
+        """
+        incoming = dict(data or {})
+        # 先校验角色与必填，再查重：同一接触者已有有效发放单时直接返回原编号，
+        # 不再触发库存/窗口等业务校验（幂等重放）。
+        self.rules.validate_pep_actor(actor, incoming)
+        contact_id = incoming["contact_id"]
+        existing = self.repository.find_active_dispense(contact_id)
+        if existing:
+            return existing, False
+        payload = self.rules.validate_pep_dispense(actor, incoming, self._lookup, now=now)
+
+        dispense_id = str(uuid4())
+        payload["dispensed_by"] = actor.user_id
+        payload["dispensed_at"] = utcnow()
+        try:
+            dispense, lot = self.repository.create_pep_dispense(
+                dispense_id, payload, payload["lot_id"], actor.user_id
+            )
+        except sqlite3.IntegrityError:
+            # 并发下另一请求已为该接触者建单：回退为返回原编号
+            existing = self.repository.find_active_dispense(contact_id)
+            if existing:
+                return existing, False
+            raise ConflictError("could not create pep dispense")
+        except StockShortage:
+            # 规则层预检后仍被并发抢空：无单据、无扣减
+            raise
+        self.audit.record(
+            dispense["id"],
+            actor,
+            "pep_dispense",
+            None,
+            "active",
+            {
+                "contact_id": dispense["data"]["contact_id"],
+                "lot_id": dispense["data"]["lot_id"],
+                "lot_number": dispense["data"]["lot_number"],
+                "course_days": dispense["data"]["course_days"],
+                "quantity": dispense["data"]["quantity"],
+            },
+        )
+        self.audit.record(
+            lot["id"],
+            actor,
+            "stock_deduct",
+            "active",
+            "active",
+            {"lot_id": lot["id"], "quantity": payload["quantity"], "reason": "pep_dispense", "dispense_id": dispense["id"]},
+        )
+        return dispense, True
 
     def list(self, kind=None, status=None):
         if kind:

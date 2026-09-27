@@ -140,6 +140,9 @@ def create_handler(service, rules, static_dir):
                     )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
+                    if parts[1] in ("pep_dispense", "pep_dispenses"):
+                        dispense, created = service.dispense_pep(actor, body)
+                        return self._send(201 if created else 200, dispense)
                     idem = self.headers.get("Idempotency-Key")
                     return self._send(
                         201,
