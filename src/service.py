@@ -1,15 +1,17 @@
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, ValidationError
 from .rules import RuleEngine
 
 
 class DomainService:
-    def __init__(self, repository, rules=None):
+    def __init__(self, repository, rules=None, clock=None):
         self.repository = repository
         self.rules = rules or RuleEngine()
         self.audit = AuditTrail(repository)
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def _lookup(self, kind, field, value):
         return self.repository.find_entities(self.rules.normalize_kind(kind), field, value)
@@ -57,6 +59,52 @@ class DomainService:
             {"patch": patch},
         )
         return updated
+
+    def dispense_pep(self, actor, data):
+        payload = dict(data or {})
+        validated = self.rules.validate_dispense(
+            actor, payload, self._lookup, now=self._clock()
+        )
+        contact_id = validated["contact_id"]
+        batch_no = validated["batch_no"]
+        courses = validated["courses"]
+        batches = self._lookup("drug_batch", "batch_no", batch_no)
+        if not batches:
+            raise ValidationError("unknown batch_no: " + str(batch_no))
+        batch = batches[0]
+        contact = self._lookup("contact", "id", contact_id)[0]
+        order = {
+            "contact_id": contact_id,
+            "case_id": contact["data"].get("case_id"),
+            "batch_no": batch_no,
+            "batch_id": batch["id"],
+            "drug_name": batch["data"].get("drug_name"),
+            "courses": courses,
+            "dispensed_by": actor.user_id,
+            "dispensed_at": self._clock().isoformat(timespec="seconds"),
+        }
+        entity, created, updated_batch = self.repository.create_dispense(
+            str(uuid4()), contact_id, batch["id"], courses, order, actor.user_id
+        )
+        if not created:
+            return entity, False
+        self.audit.record(
+            entity["id"],
+            actor,
+            "dispense",
+            None,
+            "dispensed",
+            {"contact_id": contact_id, "batch_no": batch_no, "courses": courses},
+        )
+        self.audit.record(
+            batch["id"],
+            actor,
+            "deduct",
+            batch["status"],
+            updated_batch["status"],
+            {"courses": courses, "remaining": updated_batch["data"].get("quantity")},
+        )
+        return entity, True
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import (
     ConflictError,
@@ -19,6 +19,15 @@ def _validate_case(actor, data, lookup):
             raise ConflictError("duplicate case for person and onset date")
     if not data.get("symptoms"):
         raise ValidationError("symptoms are required")
+
+
+def _validate_drug_batch(actor, data, lookup):
+    rows = lookup("drug_batch", "batch_no", data.get("batch_no")) if lookup else []
+    if rows:
+        raise ConflictError("duplicate batch_no: " + str(data.get("batch_no")))
+    quantity = data.get("quantity")
+    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 0:
+        raise ValidationError("quantity must be a non-negative integer")
 
 
 def _validate_lab_positive(actor, entity, data, lookup):
@@ -48,18 +57,21 @@ def cluster_cases(cases, max_days=14):
     return [group for group in groups if len(group["members"]) > 1]
 
 
-CUSTOM_CREATE = {'case': _validate_case}
+CUSTOM_CREATE = {'case': _validate_case, 'drug_batch': _validate_drug_batch}
 CUSTOM_TRANSITIONS = {('case', 'lab_positive'): _validate_lab_positive, ('case', 'mark_probable'): _validate_probable}
 
 
 class RuleEngine:
-    ALIASES = {'cases': 'case', 'contacts': 'contact'}
-    INITIAL_STATUS = {'case': 'reported', 'contact': 'identified'}
+    ALIASES = {'cases': 'case', 'contacts': 'contact', 'drug_batches': 'drug_batch', 'pep_dispenses': 'pep_dispense'}
+    INITIAL_STATUS = {'case': 'reported', 'contact': 'identified', 'drug_batch': 'available'}
     TRANSITIONS = {'case': {'triage': (('reported',), 'investigating'), 'lab_positive': (('investigating',), 'confirmed'), 'mark_probable': (('investigating',), 'probable'), 'recover': (('confirmed', 'probable'), 'recovered'), 'close': (('recovered',), 'closed')}, 'contact': {'begin_followup': (('identified',), 'following'), 'complete_followup': (('following',), 'completed')}}
-    CREATE_REQUIRED = {'case': ('person_id', 'onset_date', 'location', 'symptoms'), 'contact': ('case_id', 'person_id', 'exposure_start')}
+    CREATE_REQUIRED = {'case': ('person_id', 'onset_date', 'location', 'symptoms'), 'contact': ('case_id', 'person_id', 'exposure_start'), 'drug_batch': ('drug_name', 'batch_no', 'quantity')}
     ACTION_REQUIRED = {('case', 'triage'): ('clinician',), ('case', 'lab_positive'): ('lab_id', 'result'), ('case', 'mark_probable'): ('epi_link',), ('case', 'recover'): ('recovered_at',), ('case', 'close'): ('outcome',), ('contact', 'begin_followup'): ('followup_start', 'due_at'), ('contact', 'complete_followup'): ('outcome',)}
-    CREATE_ROLES = {'case': ('admin', 'clinician'), 'contact': ('admin', 'investigator')}
+    CREATE_ROLES = {'case': ('admin', 'clinician'), 'contact': ('admin', 'investigator'), 'drug_batch': ('admin',)}
     ROLE_ACTIONS = {'triage': ('admin', 'clinician'), 'lab_positive': ('admin', 'lab'), 'mark_probable': ('admin', 'investigator'), 'recover': ('admin', 'clinician'), 'close': ('admin', 'investigator'), 'begin_followup': ('admin', 'investigator'), 'complete_followup': ('admin', 'investigator')}
+    PEP_WINDOW_HOURS = 72
+    PEP_CASE_STATUSES = ('confirmed', 'probable')
+    PEP_ROLES = ('clinician',)
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -115,12 +127,48 @@ class RuleEngine:
             patch.update(extra)
         return next_status, patch
 
+    def validate_dispense(self, actor, data, lookup, now=None):
+        self._ensure_role(actor, self.PEP_ROLES)
+        self._require(data, ("contact_id", "batch_no", "courses"))
+        courses = data.get("courses")
+        if isinstance(courses, bool) or not isinstance(courses, int) or courses <= 0:
+            raise ValidationError("courses must be a positive integer")
+        contact = _find_one(lookup, "contact", "id", data.get("contact_id"))
+        if contact is None:
+            raise ValidationError("unknown contact: " + str(data.get("contact_id")))
+        if contact["status"] != "following":
+            raise InvalidTransition("contact is not under observation: " + contact["id"])
+        case = _find_one(lookup, "case", "id", contact["data"].get("case_id"))
+        if case is None:
+            raise ValidationError("contact has no linked case: " + contact["id"])
+        if case["status"] not in self.PEP_CASE_STATUSES:
+            raise InvalidTransition("case is not confirmed or probable: " + case["id"])
+        exposure_start = contact["data"].get("exposure_start")
+        try:
+            exposed_at = _parse_instant(exposure_start)
+        except (TypeError, ValueError):
+            raise ValidationError("invalid exposure_start: " + str(exposure_start))
+        moment = now or datetime.now(timezone.utc)
+        if moment - exposed_at >= timedelta(hours=self.PEP_WINDOW_HOURS):
+            raise ValidationError("pep window exceeded: 72 hours since exposure start")
+        return dict(data)
+
 
 def _find_one(lookup, kind, field, value):
     if lookup is None:
         return None
     rows = lookup(kind, field, value) or []
     return rows[0] if rows else None
+
+
+def _parse_instant(value):
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    moment = datetime.fromisoformat(text)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
 
 
 def _date_ordinal(value):

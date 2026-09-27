@@ -2,7 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, ValidationError
 
 
 def utcnow():
@@ -139,6 +139,71 @@ class SQLiteRepository:
         finally:
             connection.close()
         return self.get_entity(entity_id)
+
+    def create_dispense(self, dispense_id, contact_id, batch_id, courses, data, actor_id):
+        """Atomically create a pep_dispense order and deduct batch stock.
+
+        Returns (entity, created, batch_entity). If the contact already has a
+        valid dispense order, returns it unchanged with created=False.
+        Raises ValidationError on insufficient stock; nothing is written then.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT * FROM entities WHERE kind = 'pep_dispense'"
+            ).fetchall()
+            for row in rows:
+                existing = self._entity_from_row(row)
+                if existing["status"] == "dispensed" and existing["data"].get("contact_id") == contact_id:
+                    connection.rollback()
+                    return existing, False, None
+            batch_row = connection.execute(
+                "SELECT * FROM entities WHERE id = ? AND kind = 'drug_batch'",
+                (batch_id,),
+            ).fetchone()
+            if not batch_row:
+                raise NotFoundError("drug batch not found: " + batch_id)
+            batch = self._entity_from_row(batch_row)
+            remaining = int(batch["data"].get("quantity", 0))
+            if remaining < courses:
+                raise ValidationError(
+                    "insufficient stock for batch %s: available %s, requested %s"
+                    % (batch["data"].get("batch_no"), remaining, courses)
+                )
+            new_batch_data = dict(batch["data"])
+            new_batch_data["quantity"] = remaining - courses
+            cursor = connection.execute(
+                "UPDATE entities SET data = ?, version = version + 1, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (
+                    json.dumps(new_batch_data, ensure_ascii=False, sort_keys=True),
+                    now,
+                    batch_id,
+                    batch["version"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("version conflict on drug batch: " + batch_id)
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, 'pep_dispense', 'dispensed', 1, ?, ?, ?, ?)",
+                (
+                    dispense_id,
+                    json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    actor_id,
+                    now,
+                    now,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(dispense_id), True, self.get_entity(batch_id)
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:

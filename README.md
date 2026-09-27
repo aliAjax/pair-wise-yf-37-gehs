@@ -25,6 +25,8 @@ python3 app.py --db ./data.db --port 8303
 ## 核心对象
 
 - `case`：病例和调查状态；`contact`：接触者随访。
+- `drug_batch`：药品批次库存，`quantity` 以疗程为单位，批号唯一，仅 `admin` 可建档。
+- `pep_dispense`：暴露后预防发放单，只能通过发放接口生成，通用创建接口不可用。
 
 ## 主要接口
 
@@ -33,9 +35,14 @@ python3 app.py --db ./data.db --port 8303
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `POST /api/pep/dispense`：暴露后预防发放，请求体`{"contact_id":"...","batch_no":"...","courses":1}`。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
+
+## 暴露后预防（PEP）发放
+
+发放需同时满足：关联病例为`confirmed`（确诊）或`probable`（临床诊断）；接触者处于`following`（观察中）；距`exposure_start`未满72小时；操作者角色为`clinician`。发放按批号扣减对应疗程数的库存，库存检查、扣减和发放单生成在同一事务内完成：库存不足时整体拒绝，不扣药品也不产生发放单。同一接触者只允许一份有效发放单，重复提交返回原发放单（HTTP 200）且不重复扣库存；新发放单返回HTTP 201。演示页可选择接触者、查看库存并完成发放。
 
 ## 测试
 

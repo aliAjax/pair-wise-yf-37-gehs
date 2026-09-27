@@ -9,6 +9,11 @@
     main { max-width: 820px; margin: auto; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
     button { padding: .5rem .8rem; cursor: pointer; }
+    table { border-collapse: collapse; width: 100%; margin: .5rem 0 1rem; }
+    th, td { border: 1px solid #d1d5db; padding: .4rem .6rem; text-align: left; }
+    th { background: #f9fafb; }
+    select, input { padding: .4rem; }
+    section { border-top: 1px solid #e5e7eb; padding-top: 1rem; margin-top: 1rem; }
   </style>
 </head>
 <body>
@@ -17,18 +22,162 @@
   <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
   <pre id="result">等待操作</pre>
+
+  <section>
+    <h2>暴露后预防（PEP）发放</h2>
+    <p>
+      用户 <input id="userId" value="clinician-1" size="12">
+      角色 <select id="role">
+        <option value="clinician" selected>clinician</option>
+        <option value="admin">admin</option>
+        <option value="investigator">investigator</option>
+        <option value="lab">lab</option>
+        <option value="viewer">viewer</option>
+      </select>
+    </p>
+
+    <h3>1. 选择接触者</h3>
+    <p><button onclick="loadContacts()">刷新接触者</button></p>
+    <p><select id="contactSelect"></select></p>
+
+    <h3>2. 查看库存</h3>
+    <p>
+      <button onclick="loadBatches()">刷新库存</button>
+      新增批次（需 admin）：药品 <input id="drugName" value="PEP 基础方案" size="10">
+      批号 <input id="newBatchNo" size="8">
+      数量（疗程）<input id="newQuantity" type="number" value="10" min="0" style="width:5rem">
+      <button onclick="createBatch()">建档</button>
+    </p>
+    <table>
+      <thead><tr><th>药品</th><th>批号</th><th>剩余疗程</th></tr></thead>
+      <tbody id="batchRows"><tr><td colspan="3">暂无数据</td></tr></tbody>
+    </table>
+
+    <h3>3. 完成发放</h3>
+    <p>
+      批号 <select id="batchSelect"></select>
+      疗程 <input id="courses" type="number" value="1" min="1" style="width:4rem">
+      <button onclick="dispense()">发放</button>
+    </p>
+
+    <h3>发放记录</h3>
+    <p><button onclick="loadOrders()">刷新发放记录</button></p>
+    <pre id="orders">暂无数据</pre>
+  </section>
+
   <h2>常用接口</h2>
   <pre>GET  /health
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+POST /api/entities/&lt;id&gt;/actions
+POST /api/pep/dispense</pre>
 </main>
 <script>
+function authHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    'X-User-Id': document.getElementById('userId').value || 'anonymous',
+    'X-Role': document.getElementById('role').value,
+  };
+}
+
+function show(payload, note) {
+  document.getElementById('result').textContent =
+    (note ? note + '\n' : '') + JSON.stringify(payload, null, 2);
+}
+
 async function checkHealth() {
   const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+  show(await response.json());
 }
+
+async function loadContacts() {
+  const response = await fetch('/api/contact');
+  const data = await response.json();
+  const select = document.getElementById('contactSelect');
+  select.innerHTML = '';
+  for (const contact of data.items) {
+    const option = document.createElement('option');
+    option.value = contact.id;
+    option.textContent = contact.data.person_id + '（' + contact.status + '，暴露于 ' + contact.data.exposure_start + '）';
+    select.appendChild(option);
+  }
+  if (!data.items.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = '暂无接触者';
+    select.appendChild(option);
+  }
+}
+
+async function loadBatches() {
+  const response = await fetch('/api/drug_batch');
+  const data = await response.json();
+  const rows = document.getElementById('batchRows');
+  const select = document.getElementById('batchSelect');
+  rows.innerHTML = '';
+  select.innerHTML = '';
+  for (const batch of data.items) {
+    const tr = document.createElement('tr');
+    for (const text of [batch.data.drug_name, batch.data.batch_no, batch.data.quantity]) {
+      const td = document.createElement('td');
+      td.textContent = text;
+      tr.appendChild(td);
+    }
+    rows.appendChild(tr);
+    const option = document.createElement('option');
+    option.value = batch.data.batch_no;
+    option.textContent = batch.data.batch_no + '（余 ' + batch.data.quantity + '）';
+    select.appendChild(option);
+  }
+  if (!data.items.length) {
+    rows.innerHTML = '<tr><td colspan="3">暂无库存</td></tr>';
+  }
+}
+
+async function createBatch() {
+  const response = await fetch('/api/drug_batch', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({
+      drug_name: document.getElementById('drugName').value,
+      batch_no: document.getElementById('newBatchNo').value,
+      quantity: Number(document.getElementById('newQuantity').value),
+    }),
+  });
+  show(await response.json());
+  loadBatches();
+}
+
+async function dispense() {
+  const response = await fetch('/api/pep/dispense', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({
+      contact_id: document.getElementById('contactSelect').value,
+      batch_no: document.getElementById('batchSelect').value,
+      courses: Number(document.getElementById('courses').value),
+    }),
+  });
+  const body = await response.json();
+  const note = response.status === 200 ? '重复提交，返回原编号：'
+    : response.ok ? '发放成功：' : '发放被拒绝：';
+  show(body, note);
+  loadBatches();
+  loadOrders();
+}
+
+async function loadOrders() {
+  const response = await fetch('/api/pep_dispense');
+  const data = await response.json();
+  document.getElementById('orders').textContent =
+    data.items.length ? JSON.stringify(data.items, null, 2) : '暂无发放记录';
+}
+
+loadContacts();
+loadBatches();
+loadOrders();
 </script>
 </body>
 </html>

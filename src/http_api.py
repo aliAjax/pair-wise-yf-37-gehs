@@ -107,6 +107,9 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if parts == ["api", "pep", "dispense"]:
+                    entity, created = service.dispense_pep(actor, self._body())
+                    return self._send(201 if created else 200, entity)
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
